@@ -36,7 +36,7 @@ from livekit.agents import (
     APIConnectOptions,
     APIStatusError,
     APITimeoutError,
-    Language,
+    LanguageCode,
     NotGivenOr,
     stt,
     utils,
@@ -506,7 +506,7 @@ class STT(stt.STT):
             if text:
                 alternatives.append(
                     stt.SpeechData(
-                        language=Language(
+                        language=LanguageCode(
                             utterance.get("language", languages[0] if languages else "en")
                         ),
                         start_time=utterance.get("start", 0),
@@ -527,7 +527,9 @@ class STT(stt.STT):
         if not alternatives:
             alternatives.append(
                 stt.SpeechData(
-                    language=Language(languages[0] if languages and len(languages) > 0 else "en"),
+                    language=LanguageCode(
+                        languages[0] if languages and len(languages) > 0 else "en"
+                    ),
                     start_time=0,
                     end_time=0,
                     confidence=1.0,
@@ -1026,7 +1028,7 @@ class SpeechStream(stt.SpeechStream):
                 )
 
             if text:
-                language = Language(
+                language = LanguageCode(
                     utterance.get(
                         "language",
                         self._opts.language_config.languages[0]
@@ -1101,6 +1103,11 @@ class SpeechStream(stt.SpeechStream):
                 target_language = translation_data.get("target_language", "")
                 language = translated_utterance.get("language", target_language)
 
+                # Get original/input language and text from the original utterance
+                original_utterance = translation_data.get("utterance", {})
+                original_language = original_utterance.get("language", "")
+                original_text = original_utterance.get("text", "") or None
+
                 # Get the translated text
                 translated_text = translated_utterance.get("text", "").strip()
                 words = translated_utterance.get("words", [])
@@ -1108,7 +1115,11 @@ class SpeechStream(stt.SpeechStream):
                 if translated_text and language:
                     # Create speech data for the translation
                     speech_data = stt.SpeechData(
-                        language=Language(language),  # Use the target language
+                        language=LanguageCode(language),  # Use the target language
+                        source_languages=[LanguageCode(original_language)]
+                        if original_language
+                        else None,
+                        source_texts=[original_text or ""] if original_language else None,
                         start_time=translated_utterance.get("start", 0) + self.start_time_offset,
                         end_time=translated_utterance.get("end", 0) + self.start_time_offset,
                         confidence=translated_utterance.get("confidence", 1.0),

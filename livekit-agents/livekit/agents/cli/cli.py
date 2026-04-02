@@ -19,6 +19,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from time import time as _wall_time
 from types import FrameType
 from typing import TYPE_CHECKING, Annotated, Any, Literal
 
@@ -45,7 +46,7 @@ from ..utils import aio, shortuuid
 from ..voice import AgentSession, io
 from ..voice.run_result import RunEvent
 from ..voice.transcription import TranscriptSynchronizer
-from ..worker import AgentServer, WorkerOptions
+from ..worker import AgentServer, ServerEnvOption, WorkerOptions
 from . import proto
 from .log import JsonFormatter, _merge_record_extra, _silence_noisy_loggers
 
@@ -141,6 +142,7 @@ class ConsoleAudioOutput(io.AudioOutput):
         self._pushed_duration: float = 0.0
         self._capture_start: float = 0.0
         self._flush_task: asyncio.Task[None] | None = None
+        self._playback_started_fired: bool = False
 
         self._output_buf = bytearray()
         self._audio_lock = threading.Lock()
@@ -150,6 +152,9 @@ class ConsoleAudioOutput(io.AudioOutput):
 
         self._paused_at: float | None = None
         self._paused_duration: float = 0.0
+
+        # track the segment id to avoid stale async operations
+        self._segment_id = 0
 
     @property
     def audio_lock(self) -> threading.Lock:
@@ -175,7 +180,6 @@ class ConsoleAudioOutput(io.AudioOutput):
 
         if not self._pushed_duration:
             self._capture_start = time.monotonic()
-            self.on_playback_started(created_at=time.time())
 
         self._pushed_duration += frame.duration
         with self._audio_lock:
@@ -195,6 +199,9 @@ class ConsoleAudioOutput(io.AudioOutput):
         with self._audio_lock:
             self._output_buf.clear()
             self._output_buf_empty.set()
+            # redundant (_wait_for_playout does the same, albeit async) but defensive
+            self._segment_id += 1
+            self._playback_started_fired = False
 
         if self._pushed_duration:
             self._interrupted_ev.set()
@@ -248,6 +255,24 @@ class ConsoleAudioOutput(io.AudioOutput):
         self._interrupted_ev.clear()
         with self._audio_lock:
             self._output_buf_empty.set()
+            self._playback_started_fired = False
+            self._segment_id += 1
+
+    def _maybe_mark_playback_started(self) -> None:
+        """Mark the playback as started if it hasn't been already. Must be called under ``audio_lock``."""
+        if self._playback_started_fired:
+            return
+        self._playback_started_fired = True
+        t = _wall_time()
+        segment_id = self._segment_id
+        self._loop.call_soon_threadsafe(
+            lambda: self._on_playback_started(created_at=t, segment_id=segment_id)
+        )
+
+    def _on_playback_started(self, *, created_at: float, segment_id: int) -> None:
+        if self._segment_id != segment_id:
+            return
+        self.on_playback_started(created_at=created_at)
 
 
 class AgentsConsole:
@@ -698,6 +723,8 @@ class AgentsConsole:
                 bytes_needed = frames * 2
                 if len(self._io_audio_output.audio_buffer) < bytes_needed:
                     available_bytes = len(self._io_audio_output.audio_buffer)
+                    if available_bytes > 0:
+                        self._io_audio_output._maybe_mark_playback_started()
                     outdata[: available_bytes // 2, 0] = np.frombuffer(
                         self._io_audio_output.audio_buffer,
                         dtype=np.int16,
@@ -707,6 +734,7 @@ class AgentsConsole:
                     del self._io_audio_output.audio_buffer[:available_bytes]  # TODO: optimize
                     self.io_loop.call_soon_threadsafe(self._io_audio_output.mark_output_empty)
                 else:
+                    self._io_audio_output._maybe_mark_playback_started()
                     chunk = self._io_audio_output.audio_buffer[:bytes_needed]
                     outdata[:, 0] = np.frombuffer(chunk, dtype=np.int16, count=frames)
                     del self._io_audio_output.audio_buffer[:bytes_needed]
@@ -841,7 +869,7 @@ class RichLoggingHandler(logging.Handler):
 
         output = Table.grid(padding=(0, 1))
         output.add_column(style="log.time")
-        output.add_column(style="log.level", width=6, no_wrap=True)
+        output.add_column(style="log.level", width=8, no_wrap=True)
         output.add_column(style="log.name", width=MAX_NAME_WIDTH, no_wrap=True, overflow="ellipsis")
         output.add_column(ratio=1, style="log.message")
         output.add_column(style="log.extra", no_wrap=True)
@@ -1465,13 +1493,14 @@ def _run_console(
     output_device: str | None,
     mode: ConsoleMode,
     record: bool,
+    log_level: int | str = logging.DEBUG,
 ) -> None:
     c = AgentsConsole.get_instance()
     c.console_mode = mode
     c.enabled = True
     c.record = record
 
-    _configure_logger(c, logging.DEBUG)
+    _configure_logger(c, log_level)
     c.print("Starting console mode 🚀", tag="Agents")
 
     if c.record:
@@ -1634,6 +1663,17 @@ class LogLevel(str, enum.Enum):
 def _build_cli(server: AgentServer) -> typer.Typer:
     app = typer.Typer(rich_markup_mode="rich")
 
+    @app.callback(invoke_without_command=True)
+    def _set_dev_mode(ctx: typer.Context) -> None:
+        if ctx.invoked_subcommand is None:
+            print(ctx.get_help())
+            raise typer.Exit()
+        if ctx.invoked_subcommand in ("console", "dev"):
+            os.environ["LIVEKIT_DEV_MODE"] = "1"
+
+    _start_log_default = LogLevel(ServerEnvOption.getvalue(server.log_level, False))
+    _dev_log_default = LogLevel(ServerEnvOption.getvalue(server.log_level, True))
+
     @app.command()
     def console(
         *,
@@ -1660,6 +1700,12 @@ def _build_cli(server: AgentServer) -> typer.Typer:
             typer.Option(help="Whether to start the console in text mode"),
         ] = False,
         record: Annotated[bool, typer.Option(help="Whether to record the AgentSession")] = False,
+        log_level: Annotated[
+            LogLevel,
+            typer.Option(
+                help="Set the log level", case_sensitive=False, envvar="LIVEKIT_LOG_LEVEL"
+            ),
+        ] = _dev_log_default,
     ) -> None:
         """
         Run a [bold]LiveKit Agents[/bold] in [yellow]console[/yellow] mode.
@@ -1680,6 +1726,7 @@ def _build_cli(server: AgentServer) -> typer.Typer:
             output_device=output_device,
             mode="text" if text else "audio",
             record=record,
+            log_level=log_level.value,
         )
 
     @app.command()
@@ -1687,8 +1734,10 @@ def _build_cli(server: AgentServer) -> typer.Typer:
         *,
         log_level: Annotated[
             LogLevel,
-            typer.Option(help="Set the log level", case_sensitive=False),
-        ] = LogLevel.info,
+            typer.Option(
+                help="Set the log level", case_sensitive=False, envvar="LIVEKIT_LOG_LEVEL"
+            ),
+        ] = _start_log_default,
         url: Annotated[
             str | None,  # noqa: UP007
             typer.Option(
@@ -1735,8 +1784,10 @@ def _build_cli(server: AgentServer) -> typer.Typer:
         *,
         log_level: Annotated[
             LogLevel,
-            typer.Option(help="Set the log level", case_sensitive=False),
-        ] = LogLevel.debug,
+            typer.Option(
+                help="Set the log level", case_sensitive=False, envvar="LIVEKIT_LOG_LEVEL"
+            ),
+        ] = _dev_log_default,
         reload: Annotated[
             bool,
             typer.Option(help="Enable auto-reload of the server when (code) files change."),
