@@ -26,6 +26,7 @@ from livekit.agents import (
     LanguageCode,
     stt,
     utils,
+    vad,
 )
 from livekit.agents.types import (
     NOT_GIVEN,
@@ -37,10 +38,12 @@ from speechmatics.voice import (
     AdditionalVocabEntry,
     AgentServerMessageType,
     AudioEncoding,
+    EndOfTurnConfig,
     OperatingPoint,
     SpeakerFocusConfig,
     SpeakerFocusMode,
     SpeakerIdentifier,
+    VoiceActivityConfig,
     VoiceAgentClient,
     VoiceAgentConfig,
     VoiceAgentConfigPreset,
@@ -64,8 +67,8 @@ class TurnDetectionMode(str, Enum):
     The `TurnDetectionMode.FIXED` mode uses a fixed amount of silence, as determined by the
     `end_of_utterance_silence_trigger` parameter.
 
-    The default is `TurnDetectionMode.ADAPTIVE` which uses voice activity detection to determine
-    end of speech.
+    The default is `TurnDetectionMode.EXTERNAL` which delegates endpointing to an external VAD
+    (Silero is auto-loaded if no `vad` is provided).
     """
 
     EXTERNAL = "external"
@@ -84,7 +87,7 @@ class STTOptions:
     domain: str | None = None
 
     # Endpointing mode
-    turn_detection_mode: TurnDetectionMode = TurnDetectionMode.ADAPTIVE
+    turn_detection_mode: TurnDetectionMode = TurnDetectionMode.EXTERNAL
 
     # Output formatting
     speaker_active_format: str | None = None
@@ -108,6 +111,8 @@ class STTOptions:
     max_delay: float | None = None
     end_of_utterance_silence_trigger: float | None = None
     end_of_utterance_max_delay: float | None = None
+    end_of_turn_config: EndOfTurnConfig | None = None
+    vad_config: VoiceActivityConfig | None = None
     punctuation_overrides: dict | None = None
     include_partials: bool | None = None
 
@@ -124,7 +129,7 @@ class STT(stt.STT):
         *,
         api_key: NotGivenOr[str] = NOT_GIVEN,
         base_url: NotGivenOr[str] = NOT_GIVEN,
-        turn_detection_mode: TurnDetectionMode = TurnDetectionMode.ADAPTIVE,
+        turn_detection_mode: TurnDetectionMode = TurnDetectionMode.EXTERNAL,
         operating_point: NotGivenOr[OperatingPoint] = NOT_GIVEN,
         domain: NotGivenOr[str] = NOT_GIVEN,
         language: str = "en",
@@ -134,6 +139,8 @@ class STT(stt.STT):
         max_delay: NotGivenOr[float] = NOT_GIVEN,
         end_of_utterance_silence_trigger: NotGivenOr[float] = NOT_GIVEN,
         end_of_utterance_max_delay: NotGivenOr[float] = NOT_GIVEN,
+        end_of_turn_config: NotGivenOr[EndOfTurnConfig] = NOT_GIVEN,
+        vad_config: NotGivenOr[VoiceActivityConfig] = NOT_GIVEN,
         additional_vocab: NotGivenOr[list[AdditionalVocabEntry]] = NOT_GIVEN,
         punctuation_overrides: NotGivenOr[dict] = NOT_GIVEN,
         speaker_sensitivity: NotGivenOr[float] = NOT_GIVEN,
@@ -147,6 +154,7 @@ class STT(stt.STT):
         known_speakers: NotGivenOr[list[SpeakerIdentifier]] = NOT_GIVEN,
         sample_rate: int = 16000,
         audio_encoding: AudioEncoding = AudioEncoding.PCM_S16LE,
+        vad: NotGivenOr[vad.VAD | None] = NOT_GIVEN,
         **kwargs: Any,
     ):
         """Create a new instance of Speechmatics STT using the Voice SDK.
@@ -164,7 +172,7 @@ class STT(stt.STT):
                 `ADAPTIVE` for simple VAD or `SMART_TURN` for ML-based endpointing.
                 `FIXED` uses a fixed amount of silence, as determined by the
                 `end_of_utterance_silence_trigger` parameter.
-                Defaults to `TurnDetectionMode.ADAPTIVE`.
+                Defaults to `TurnDetectionMode.EXTERNAL`.
 
             operating_point: Operating point for transcription accuracy vs. latency
                 tradeoff. Overrides preset if provided. Optional.
@@ -197,6 +205,18 @@ class STT(stt.STT):
             end_of_utterance_max_delay: Maximum delay in seconds for end of utterance.
                 Must be greater than `end_of_utterance_silence_trigger`.
                 Overrides preset if provided. Optional.
+
+            end_of_turn_config: End-of-turn configuration, controlling the penalty
+                multipliers applied to the `end_of_utterance_silence_trigger`, the
+                minimum end-of-turn delay and forced end-of-utterance behaviour.
+                Replaces the preset's `EndOfTurnConfig` when provided. Optional.
+
+            vad_config: Client-side voice activity configuration used by the
+                `ADAPTIVE` and `SMART_TURN` presets (e.g. `silence_duration` and
+                `threshold`). Replaces the preset's `VoiceActivityConfig` when
+                provided. Cannot be combined with `turn_detection_mode=EXTERNAL`
+                when enabled, since the external VAD already controls turn
+                boundaries. Optional.
 
             additional_vocab: List of additional vocabulary entries to increase the
                 weight of specific words in the transcription model. Defaults to [].
@@ -248,9 +268,62 @@ class STT(stt.STT):
 
             audio_encoding: Audio encoding format. Defaults to `AudioEncoding.PCM_S16LE`.
 
+            vad: Optional external Voice Activity Detector. When provided, the STT
+                engine's endpointing is replaced by the VAD: each audio frame is
+                forwarded to the VAD, and `finalize()` is called whenever the VAD
+                reports end of speech. Providing a VAD implicitly sets
+                `turn_detection_mode` to `EXTERNAL`. When `turn_detection_mode` is
+                `EXTERNAL` and `vad` is not provided, Silero is auto-loaded to drive
+                finalize. Pass `vad=None` to opt out of the auto-load if you intend
+                to call `finalize()` from your own logic. Defaults to NOT_GIVEN.
+
             **kwargs: Catches deprecated parameters. A warning is logged for any
                 recognised deprecated name.
         """
+
+        # Resolve final turn_detection_mode — a real `vad` forces EXTERNAL.
+        if is_given(vad) and vad is not None and turn_detection_mode != TurnDetectionMode.EXTERNAL:
+            logger.info(
+                "External `vad` provided; overriding turn_detection_mode "
+                f"{turn_detection_mode.value!r} -> 'external'"
+            )
+            turn_detection_mode = TurnDetectionMode.EXTERNAL
+
+        # An enabled client-side VAD config must not be combined with an
+        # external VAD: in EXTERNAL mode the external VAD (or manual
+        # finalize()) drives turn boundaries while the client-side VAD would
+        # also endpoint the same audio, producing premature or duplicate
+        # boundaries. Validate before the Silero auto-load below so callers get
+        # this configuration error instead of an unrelated Silero ImportError.
+        resolved_vad_config = vad_config if is_given(vad_config) else None
+        if (
+            resolved_vad_config is not None
+            and resolved_vad_config.enabled
+            and turn_detection_mode == TurnDetectionMode.EXTERNAL
+        ):
+            raise ValueError(
+                "vad_config with enabled=True cannot be combined with "
+                "turn_detection_mode=EXTERNAL: the external VAD (or manual finalize()) "
+                "already controls turn boundaries. Use the built-in endpointing modes "
+                "(ADAPTIVE or SMART_TURN) with vad_config instead."
+            )
+
+        # In EXTERNAL mode the STT does not endpoint on its own. Auto-load Silero
+        # so finalize() is wired up, unless the caller explicitly passed `vad=None`
+        # to opt out (they'll drive finalize() themselves).
+        if turn_detection_mode == TurnDetectionMode.EXTERNAL and not is_given(vad):
+            try:
+                from livekit.plugins.silero import VAD as SileroVAD
+            except ImportError as e:
+                raise ImportError(
+                    "livekit-plugins-silero is required for Speechmatics with "
+                    "turn_detection_mode=EXTERNAL (no server-side endpointing). "
+                    "Pass `vad=None` to opt out and drive finalize() manually."
+                ) from e
+            vad = SileroVAD.load()
+
+        # Normalize NOT_GIVEN -> None for downstream storage.
+        self._vad = vad if is_given(vad) else None
 
         # Set default values for optional parameters
         super().__init__(
@@ -284,6 +357,8 @@ class STT(stt.STT):
             max_delay=_set(max_delay),
             end_of_utterance_silence_trigger=_set(end_of_utterance_silence_trigger),
             end_of_utterance_max_delay=_set(end_of_utterance_max_delay),
+            end_of_turn_config=end_of_turn_config if is_given(end_of_turn_config) else None,
+            vad_config=vad_config if is_given(vad_config) else None,
             punctuation_overrides=_set(punctuation_overrides),
             include_partials=_set(include_partials),
             enable_diarization=_set(enable_diarization),
@@ -359,6 +434,7 @@ class STT(stt.STT):
             conn_options=conn_options,
             config=self._prepare_config(language),
             id=len(self._streams),
+            vad_instance=self._vad,
         )
 
         # Add to the list of streams
@@ -436,6 +512,7 @@ class STT(stt.STT):
             "enable_diarization",
             "end_of_utterance_max_delay",
             "end_of_utterance_silence_trigger",
+            "end_of_turn_config",
             "include_partials",
             "max_delay",
             "max_speakers",
@@ -443,6 +520,7 @@ class STT(stt.STT):
             "prefer_current_speaker",
             "punctuation_overrides",
             "speaker_sensitivity",
+            "vad_config",
         ]
 
         # Override preset parameters if provided
@@ -575,6 +653,7 @@ class SpeechStream(stt.RecognizeStream):
         conn_options: APIConnectOptions,
         config: VoiceAgentConfig,
         id: int,
+        vad_instance: vad.VAD | None = None,
     ) -> None:
         super().__init__(
             stt=stt,
@@ -588,6 +667,9 @@ class SpeechStream(stt.RecognizeStream):
         self._client: VoiceAgentClient | None = None
         self._msg_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._speech_duration: float = 0
+
+        self._vad: vad.VAD | None = vad_instance
+        self._vad_stream: vad.VADStream | None = None
 
         self._tasks: list[asyncio.Task] = []
 
@@ -644,12 +726,22 @@ class SpeechStream(stt.RecognizeStream):
         await self._client.connect()
         logger.debug("Connected to Speechmatics STT service")
 
+        # Open external VAD stream (if provided) before tasks start pushing frames
+        if self._vad is not None:
+            self._vad_stream = self._vad.stream()
+
         # Audio and messaging tasks
         audio_task = asyncio.create_task(self._process_audio())
         message_task = asyncio.create_task(self._process_messages())
 
         # Tasks
         self._tasks = [audio_task, message_task]
+
+        # Optional VAD task: calls `client.finalize()` on end of speech
+        vad_task: asyncio.Task | None = None
+        if self._vad_stream is not None:
+            vad_task = asyncio.create_task(self._process_vad(self._vad_stream))
+            self._tasks.append(vad_task)
 
         # Wait for tasks to complete
         try:
@@ -665,6 +757,14 @@ class SpeechStream(stt.RecognizeStream):
                 await audio_task
             except asyncio.CancelledError:
                 pass
+
+            # Close the VAD stream so its task drains and exits
+            if self._vad_stream is not None:
+                await self._vad_stream.aclose()
+                self._vad_stream = None
+
+            if vad_task is not None:
+                await utils.aio.cancel_and_wait(vad_task)
 
             # Disconnect flushes final messages from the STT engine
             await self._client.disconnect()
@@ -695,6 +795,9 @@ class SpeechStream(stt.RecognizeStream):
                 if isinstance(data, self._FlushSentinel):
                     frames = audio_bstream.flush()
                 else:
+                    # Forward the original frame to the VAD before resampling/repacking
+                    if self._vad_stream is not None:
+                        self._vad_stream.push_frame(data)
                     frames = audio_bstream.write(data.data.tobytes())
 
                 # Send audio frames
@@ -703,6 +806,20 @@ class SpeechStream(stt.RecognizeStream):
                         self._speech_duration += frame.duration
                         await self._client.send_audio(frame.data.tobytes())
 
+            # No more input — let the VAD flush any pending event
+            if self._vad_stream is not None:
+                self._vad_stream.end_input()
+
+        except asyncio.CancelledError:
+            pass
+
+    async def _process_vad(self, vad_stream: vad.VADStream) -> None:
+        """Call `client.finalize()` whenever the external VAD reports end of speech."""
+        try:
+            async for ev in vad_stream:
+                if ev.type == vad.VADEventType.END_OF_SPEECH:
+                    if self._client and self._client._is_connected:
+                        self._client.finalize()
         except asyncio.CancelledError:
             pass
 
@@ -730,11 +847,17 @@ class SpeechStream(stt.RecognizeStream):
             AgentServerMessageType.RECOGNITION_STARTED,
             AgentServerMessageType.INFO,
         ]:
-            logger.info(f"{event} -> {message}")
+            logger.info(
+                "speechmatics sent info message", extra={"event": event, "lk.pii.message": message}
+            )
         elif event == AgentServerMessageType.WARNING:
-            logger.warning(f"{event} -> {message}")
+            logger.warning(
+                "speechmatics sent warning", extra={"event": event, "lk.pii.message": message}
+            )
         elif event == AgentServerMessageType.ERROR:
-            logger.error(f"{event} -> {message}")
+            logger.error(
+                "speechmatics sent error", extra={"event": event, "lk.pii.message": message}
+            )
 
         # Handle the messages
         elif event == AgentServerMessageType.ADD_PARTIAL_SEGMENT:
@@ -752,7 +875,7 @@ class SpeechStream(stt.RecognizeStream):
 
         # Log all other messages
         else:
-            logger.debug(f"{event} -> {message}")
+            logger.debug(f"unhandled message: {event}", extra={"lk.pii.message": message})
 
     def _handle_partial_segment(self, message: dict[str, Any]) -> None:
         """Handle AddPartialSegment events."""
@@ -828,7 +951,6 @@ class SpeechStream(stt.RecognizeStream):
                 start_time=segment.get("metadata", {}).get("start_time", 0)
                 + self.start_time_offset,
                 end_time=segment.get("metadata", {}).get("end_time", 0) + self.start_time_offset,
-                confidence=1.0,
             )
 
             # Create speech event
@@ -852,6 +974,11 @@ class SpeechStream(stt.RecognizeStream):
                     await task
                 except asyncio.CancelledError:
                     pass
+
+        # Close the VAD stream if it's still open
+        if self._vad_stream is not None:
+            await self._vad_stream.aclose()
+            self._vad_stream = None
 
         # Close the client
         if self._client and self._client._is_connected:
